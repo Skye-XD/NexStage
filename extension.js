@@ -95,6 +95,25 @@ export default class StageArc extends Extension {
         this._restackedSig = global.display.connect('restacked', () => {
             this._refresh();
         });
+        // A window being dragged reveals the strip at the edge so it can be
+        // dropped there. Pointer crossings are not delivered during a grab, so
+        // the poll has to run, and track the pointer, for the whole drag.
+        this._grabBeginSig = global.display.connect('grab-op-begin', (_d, win, op) => {
+            if (op === Meta.GrabOp.MOVING || op === Meta.GrabOp.MOVING_UNCONSTRAINED) {
+                this._windowGrab = true;
+                // Where it was before the drag, to put it back if it is
+                // dropped into the strip.
+                this._grabStart = win ? {
+                    win,
+                    rect: win.get_frame_rect(),
+                    maximized: win.maximized_horizontally && win.maximized_vertically,
+                } : null;
+            }
+        });
+        this._grabEndSig = global.display.connect('grab-op-end', (_d, win, op) => {
+            this._windowGrab = false;
+            this._onWindowDropped(win, op);
+        });
         this._connectWorkspaceSignals();
         this._wsSwitchSig = global.workspace_manager.connect('active-workspace-changed', () => {
             this._disconnectWorkspaceSignals();
@@ -155,7 +174,7 @@ export default class StageArc extends Extension {
     disable() {
         this._cancelDrag();
         this._teardownKeybindings();
-        if (this._contextMenu) { this._contextMenu.destroy(); this._contextMenu = null; }
+        this._closeContextMenu();
         this._hideTooltip();
         if (this._tooltipTimer) { GLib.source_remove(this._tooltipTimer); this._tooltipTimer = null; }
 
@@ -164,6 +183,8 @@ export default class StageArc extends Extension {
         if (this._monitorSig)       { Main.layoutManager.disconnect(this._monitorSig);  this._monitorSig      = null; }
         if (this._settingsSig) { this._settings.disconnect(this._settingsSig); this._settingsSig = null; }
         if (this._focusSig)    { global.display.disconnect(this._focusSig);    this._focusSig = null; }
+        if (this._grabEndSig)  { global.display.disconnect(this._grabEndSig);  this._grabEndSig = null; }
+        if (this._grabBeginSig) { global.display.disconnect(this._grabBeginSig); this._grabBeginSig = null; }
         if (this._winCreatedSig) { global.display.disconnect(this._winCreatedSig); this._winCreatedSig = null; }
         if (this._restackedSig) { global.display.disconnect(this._restackedSig); this._restackedSig = null; }
         if (this._wsSwitchSig) { global.workspace_manager.disconnect(this._wsSwitchSig); this._wsSwitchSig = null; }
@@ -293,6 +314,117 @@ export default class StageArc extends Extension {
         const newKey = [...groupMembers].sort().join('|');
         groupMembers.forEach(aId => this._mergeMap.set(aId, newKey));
         this._saveMergeMap();
+    }
+
+    // Stage Manager's "drag an app from the centre to the strip removes it from
+    // the group": a window move that ends over the visible sidebar takes its
+    // app out of its merged group and sends it to the strip as a stage of its
+    // own. The pointer reveals the sidebar on the way, as the poll already
+    // does for a held button at the edge. An app that is not merged is left
+    // where it was dropped.
+    _onWindowDropped(win, op) {
+        const [px, py] = global.get_pointer();
+        const geo = this._geo;
+        if (!win || !this._isVisible) return;
+        if (op !== Meta.GrabOp.MOVING && op !== Meta.GrabOp.MOVING_UNCONSTRAINED) return;
+
+        if (px < geo.visX || px > geo.visX + geo.panelW ||
+            py < geo.visY || py > geo.visY + geo.panelH)
+            return;
+
+        // Into the strip it goes, as on macOS. A merged app also leaves its
+        // group, so it becomes a stage of its own there.
+        const app = Shell.WindowTracker.get_default().get_window_app(win);
+        const appId = app?.get_id();
+        if (appId && this._mergeMap.has(appId))
+            this._unmergeApp(appId);
+        if (!win.can_minimize()) { this._refresh(); return; }
+
+        // Shrink into the strip where it was dropped, then minimize with the
+        // shell's effect skipped -- the minimize animation flies to the dock,
+        // which read as the window going to the panel rather than the strip.
+        const actor = win.get_compositor_private();
+        if (!actor) { win.minimize(); this._refresh(); return; }
+        const [ax, ay] = actor.get_transformed_position();
+        const tx = geo.visX + geo.panelW / 2, ty = py;
+        actor.set_pivot_point(0, 0);
+        actor.ease({
+            scale_x: 0.08, scale_y: 0.08,
+            translation_x: tx - ax - actor.width * 0.04,
+            translation_y: ty - ay - actor.height * 0.04,
+            opacity: 0,
+            duration: 250,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+            onStopped: () => {
+                // The magic-lamp extension animates every minimize and ignores
+                // skipNextEffect, so stay invisible until the actor is hidden
+                // and only then put the transforms back.
+                let restored = false;
+                const restore = () => {
+                    if (restored) return;
+                    restored = true;
+                    try {
+                        actor.disconnect(hideId);
+                        actor.set_scale(1, 1);
+                        actor.translation_x = 0;
+                        actor.translation_y = 0;
+                        actor.opacity = 255;
+                    } catch (_e) {
+                        // The window closed meanwhile; nothing to restore.
+                    }
+                };
+                const hideId = actor.connect('hide', restore);
+                // Never left invisible if the minimize does not hide it.
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                    restore();
+                    return GLib.SOURCE_REMOVE;
+                });
+                // Back to where it was before the drag, while it is invisible,
+                // so it comes out of the strip there and not at the screen
+                // edge it was dropped on.
+                const start = this._grabStart?.win === win ? this._grabStart : null;
+                if (start?.maximized)
+                    win.maximize();
+                else if (start)
+                    win.move_frame(true, start.rect.x, start.rect.y);
+
+                // Opt out of the magic-lamp genie to the dock (patched in
+                // place to honour this one-shot flag).
+                actor._skipMinimizeEffect = true;
+                win.minimize();
+                this._refresh();
+            },
+        });
+    }
+
+    // Bring up a single window of a stage, out of its card if minimized.
+    _openOneWindow(win, fromX, fromY) {
+        if (win.minimized) this._flyOutOfStrip(win, fromX, fromY);
+        win.activate(global.get_current_time());
+        this._keyOpened = false;
+        this._refresh();
+    }
+
+    // The reverse of a drop into the strip: unminimize without the genie from
+    // the dock, and grow the window out of its card instead.
+    _flyOutOfStrip(win, fromX, fromY) {
+        const actor = win.get_compositor_private();
+        if (!actor) { win.unminimize(); return; }
+        actor._skipMinimizeEffect = true;
+        win.unminimize();
+        actor.remove_all_transitions();
+        actor.set_pivot_point(0, 0);
+        actor.set_scale(0.08, 0.08);
+        actor.translation_x = fromX - actor.x;
+        actor.translation_y = fromY - actor.y;
+        actor.opacity = 0;
+        actor.ease({
+            scale_x: 1, scale_y: 1,
+            translation_x: 0, translation_y: 0,
+            opacity: 255,
+            duration: 300,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        });
     }
 
     _unmergeApp(appId) {
@@ -435,8 +567,12 @@ export default class StageArc extends Extension {
               + 'box-shadow: 0 4px 24px rgba(0,0,0,0.4); '
               + 'border: 1px solid rgba(255,255,255,0.06);'
             : 'background-color: transparent;';
+        // Not reactive itself: only the cards take clicks. The panel is an
+        // invisible rectangle around them (no background here), and as a
+        // reactive actor it swallowed clicks meant for windows beneath,
+        // between and around the cards. Scrolls on a card still bubble to it.
         this._panel = new St.Widget({
-            reactive: true,
+            reactive: false,
             clip_to_allocation: true,
             style: panelStyle,
             width: geo.panelW,
@@ -444,6 +580,7 @@ export default class StageArc extends Extension {
         });
         this._panel.set_position(geo.panelX, geo.panelY);
         Main.layoutManager.addChrome(this._panel, { trackFullscreen: true });
+        if (!this._isVisible) this._panel.hide();   // shown again by _showPanel
 
         this._edge = new St.Widget({
             reactive: true,
@@ -593,7 +730,7 @@ export default class StageArc extends Extension {
         // Poll at 50ms when active (drag/visible), skip cheaply when idle
         this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, 50, () => {
             // Fast path: skip pointer query when nothing is happening
-            if (!this._isVisible && !this._dragging && !this._dragCandidate) {
+            if (!this._isVisible && !this._dragging && !this._dragCandidate && !this._windowGrab) {
                 return GLib.SOURCE_CONTINUE;
             }
 
@@ -607,7 +744,23 @@ export default class StageArc extends Extension {
                     if      (this._pos === 'bottom') hot = py >= mon.y + mon.height - 8;
                     else if (this._pos === 'right')  hot = px >= mon.x + mon.width - 8;
                     else                             hot = px <= mon.x + 8;
-                    if (held && hot && !this._isVisible) this._showPanel();
+                    if ((held || this._windowGrab) && hot && !this._isVisible) {
+                        this._showPanel();
+                    }
+                }
+
+                // Hide by position, not by crossing events: the strip slides
+                // in under a pointer already at the edge, and the panel's
+                // leave-event never fired, so it stayed open for good.
+                if (this._isVisible && !this._dragging && !this._persistMode &&
+                    !this._contextMenu) {
+                    const geo = this._geo;
+                    const inside = px >= geo.visX - 8 && px <= geo.visX + geo.panelW + 8 &&
+                                   py >= geo.visY - 8 && py <= geo.visY + geo.panelH + 8;
+                    // Opened from the keyboard, it stays until the pointer has
+                    // visited it once.
+                    if (inside) { this._keyOpened = false; this._cancelHide(); }
+                    else if (!this._keyOpened && !this._hideTimer) this._startHide();
                 }
 
                 if (this._dragCandidate && held) {
@@ -770,25 +923,31 @@ export default class StageArc extends Extension {
 
     _setupKeybindings() {
         this._bindKey('keybinding-toggle', () => {
-            this._isVisible ? this._hidePanel() : this._showPanel();
+            if (this._isVisible) { this._hidePanel(); return; }
+            this._keyOpened = true;
+            this._showPanel();
         });
         // Stepping through stages shows the sidebar: moving a selection
         // nobody can see, then activating it, read as the sidebar opening
         // and snapping shut.
-        this._bindKey('keybinding-next', () => {
-            if (!this._isVisible) this._showPanel();
-            this._scrollTo(Math.round(this._offset) + 1);
-        });
-        this._bindKey('keybinding-prev', () => {
-            if (!this._isVisible) this._showPanel();
-            this._scrollTo(Math.round(this._offset) - 1);
-        });
+        // Cmd+Tab-like stepping. The upstream bindings moved the arc's scroll
+        // offset, which the vertical strip neither uses nor shows: nothing
+        // highlighted, and activate picked whatever the offset pointed at --
+        // usually the stage already in front.
+        this._bindKey('keybinding-next', () => this._stepKeySelection(1));
+        this._bindKey('keybinding-prev', () => this._stepKeySelection(-1));
         this._bindKey('keybinding-activate', () => {
-            const idx = Math.round(this._offset);
-            if (this._groups[idx]) {
-                if (!this._isVisible) this._showPanel();
-                this._activateGroup(this._groups[idx]);
-            }
+            const idx = this._keySel ?? (this._layoutMode === 'vertical' ? null : Math.round(this._offset));
+            const group = idx === null ? null : this._groups[idx];
+            this._keySel = null;
+            if (!group) return;
+            if (!this._isVisible) this._showPanel();
+            this._activateGroup(group);
+            // A keyboard choice is final: the strip goes once it is made.
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+                this._hidePanel();
+                return GLib.SOURCE_REMOVE;
+            });
         });
         this._bindKey('keybinding-close', () => {
             const idx = Math.round(this._offset);
@@ -801,6 +960,27 @@ export default class StageArc extends Extension {
                 });
             }
         });
+    }
+
+    // Index of the stage holding the focused window, else the first.
+    _frontGroupIndex() {
+        const focused = global.display.get_focus_window();
+        const i = this._groups.findIndex(g => g.windows.includes(focused));
+        return i >= 0 ? i : 0;
+    }
+
+    _stepKeySelection(dir) {
+        if (!this._isVisible) { this._keyOpened = true; this._showPanel(); }
+        const n = this._groups.length;
+        if (!n) return;
+        const from = this._keySel ?? this._frontGroupIndex();
+        this._keySel = (from + dir + n) % n;
+        if (this._layoutMode === 'vertical') {
+            this._scrollVerticalTo(this._keySel);
+            this._redrawVertical();
+        } else {
+            this._scrollTo(this._keySel);
+        }
     }
 
     _bindKey(settingKey, callback) {
@@ -880,7 +1060,7 @@ export default class StageArc extends Extension {
         // Always clean up tooltip and context menu on refresh
         this._hideTooltip();
         if (this._tooltipTimer) { GLib.source_remove(this._tooltipTimer); this._tooltipTimer = null; }
-        if (this._contextMenu) { this._contextMenu.destroy(); this._contextMenu = null; }
+        this._closeContextMenu();
 
         if (this._refreshTo) GLib.source_remove(this._refreshTo);
         this._refreshTo = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
@@ -1255,21 +1435,26 @@ export default class StageArc extends Extension {
         grid._iconSz  = sz;
         grid._iconOvf = ovf;
 
+        // One icon per app in a stage, not one per window: two windows of the
+        // same app drew its icon twice.
+        const seenApps = new Set();
         grid._cards.forEach(({ win }, i) => {
             const app = tracker.get_window_app(win);
-            if (!app) return;
+            if (!app || seenApps.has(app.get_id())) return;
+            seenApps.add(app.get_id());
+            const n = seenApps.size - 1;   // icons placed so far
 
             // Base (stacked) position — horizontal fan from corner
             let bx, by;
             if (this._pos === 'right') {
-                bx = padH + gridW - sz + ovf - i * dX;
-                by = sH - sz + ovf - i * dY;
+                bx = padH + gridW - sz + ovf - n * dX;
+                by = sH - sz + ovf - n * dY;
             } else if (this._pos === 'bottom') {
-                bx = padH - ovf + i * dX;
-                by = -ovf + i * dY;
+                bx = padH - ovf + n * dX;
+                by = -ovf + n * dY;
             } else {
-                bx = padH - ovf + i * dX;
-                by = sH - sz + ovf - i * dY;
+                bx = padH - ovf + n * dX;
+                by = sH - sz + ovf - n * dY;
             }
 
             const icon = new St.Widget({
@@ -1384,6 +1569,13 @@ export default class StageArc extends Extension {
             container._grid = grid;
             container._dim  = null;
 
+            // Keyboard selection: enlarged, upright, bright border.
+            if (this._keySel === idx && grid._cards[0]) {
+                container.set_rotation_angle(Clutter.RotateAxis.Z_AXIS, 0);
+                container.set_scale(1.06, 1.06);
+                const fc = grid._cards[0].card;
+                fc.style = fc.style.replace(/border: [^;]+;/, 'border: 2px solid rgba(255,255,255,0.85);');
+            } else
             // Active group highlight: bright border on front card
             if (this._highlightActive && isActive && grid._cards[0]) {
                 const fc = grid._cards[0].card;
@@ -1450,7 +1642,10 @@ export default class StageArc extends Extension {
                     });
                     // Fan stack after 350ms hold
                     const g = container._grid;
-                    if (g && !g._fanned && !g._fanTimer) {
+                    // The vertical strip keeps a stack stacked, as macOS does:
+                    // its fan spreads the cards down by nearly a card height,
+                    // over the label and the next stage.
+                    if (g && !g._fanned && !g._fanTimer && false) {
                         g._fanTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
                             g._fanTimer = null;
                             if (container.hover) {
@@ -1782,17 +1977,22 @@ export default class StageArc extends Extension {
         if (count <= 1) return;
 
         const badgeSize = Math.round(18 * scale);
-        const badge = new St.Label({
-            text: `${count}`,
+        // A label stretched by min-height draws its text at the top; a fixed
+        // box centres it both ways.
+        const badge = new St.Bin({
+            height: badgeSize,
             style: `background-color: rgba(255,255,255,0.15); `
-                 + `color: rgba(255,255,255,0.9); `
-                 + `font-size: ${Math.round(10 * scale)}px; `
-                 + `font-weight: 700; `
                  + `border-radius: ${Math.round(badgeSize / 2)}px; `
-                 + `text-align: center; `
                  + `padding: 0 ${Math.round(4 * scale)}px; `
-                 + `min-width: ${badgeSize}px; `
-                 + `min-height: ${badgeSize}px;`,
+                 + `min-width: ${badgeSize}px;`,
+            child: new St.Label({
+                text: `${count}`,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                style: `color: rgba(255,255,255,0.9); `
+                     + `font-size: ${Math.round(10 * scale)}px; `
+                     + `font-weight: 700;`,
+            }),
         });
         badge.set_position(padH + gridW - badgeSize - Math.round(4 * scale), gridH - badgeSize - Math.round(2 * scale));
         container.add_child(badge);
@@ -1918,11 +2118,20 @@ export default class StageArc extends Extension {
 
     // ── Context Menu ─────────────────────────────────────────────────────────
 
-    _showContextMenu(group, px, py) {
-        if (this._contextMenu) {
-            this._contextMenu.destroy();
-            this._contextMenu = null;
+    // Menu, backdrop and listener go together.
+    _closeContextMenu() {
+        if (this._contextMenuClickId) {
+            try { global.stage.disconnect(this._contextMenuClickId); } catch (_) {}
+            this._contextMenuClickId = null;
         }
+        this._contextMenu?.destroy();
+        this._contextMenu = null;
+        this._menuBackdrop?.destroy();
+        this._menuBackdrop = null;
+    }
+
+    _showContextMenu(group, px, py) {
+        this._closeContextMenu();
 
         const win = group.windows[0];
         if (!win) return;
@@ -1954,6 +2163,18 @@ export default class StageArc extends Extension {
             }},
         ];
 
+        // Multi-window stage: each window by title, to open just that one.
+        if (group.windows.length > 1) {
+            const card = this._containers.find(c => c._groupRef === group);
+            const [cardX, cardY] = card ? card.get_transformed_position() : [this._geo.visX, this._geo.visY];
+            const windowItems = group.windows.map(w => {
+                let t = w.get_title() || group.app.get_name() || '';
+                if (t.length > 24) t = t.slice(0, 23) + '…';
+                return { label: t, action: () => this._openOneWindow(w, cardX, cardY) };
+            });
+            items.unshift(...windowItems, null);
+        }
+
         // Multi-window options
         if (group.windows.length > 1) {
             const allMinimized = group.windows.every(w => w.minimized);
@@ -1980,7 +2201,15 @@ export default class StageArc extends Extension {
             }});
         }
 
-        items.forEach(({ label, action }) => {
+        items.forEach(entry => {
+            if (!entry) {   // divider between the window list and the actions
+                menu.add_child(new St.Widget({
+                    height: 1,
+                    style: 'background-color: rgba(255,255,255,0.12); margin: 4px 10px;',
+                }));
+                return;
+            }
+            const { label, action } = entry;
             const item = new St.Button({
                 reactive: true,
                 track_hover: true,
@@ -2001,48 +2230,57 @@ export default class StageArc extends Extension {
                 item.style = 'padding: 8px 16px; border-radius: 0; text-align: left;';
             });
             item.connect('clicked', () => {
-                // Disconnect outside-click handler, close menu, run action
-                if (this._contextMenuClickId) {
-                    try { global.stage.disconnect(this._contextMenuClickId); } catch (_) {}
-                    this._contextMenuClickId = null;
-                }
-                if (this._contextMenu) {
-                    this._contextMenu.destroy();
-                    this._contextMenu = null;
-                }
+                this._closeContextMenu();
                 action();
             });
             menu.add_child(item);
         });
 
+        // Closed by a click anywhere outside it. A stage button-press handler
+        // never saw clicks on app windows -- those go to the client -- so the
+        // menu stayed open; a transparent full-screen backdrop beneath it
+        // catches every outside click instead.
+        const backdrop = new St.Widget({
+            reactive: true,
+            x: 0, y: 0,
+            width: global.stage.width,
+            height: global.stage.height,
+        });
+        backdrop.connect('button-press-event', () => {
+            this._closeContextMenu();
+            return Clutter.EVENT_STOP;
+        });
+        Main.uiGroup.add_child(backdrop);
+        this._menuBackdrop = backdrop;
+
         menu.set_position(px, py);
         Main.uiGroup.add_child(menu);
         this._contextMenu = menu;
-
-        // Auto-close on click outside (but not on the menu itself)
-        const clickId = global.stage.connect('button-press-event', (_s, event) => {
-            const [ex, ey] = event.get_coords();
-            const [mx, my] = menu.get_transformed_position();
-            const mw = menu.width;
-            const mh = menu.height;
-            // If click is inside menu, let the menu items handle it
-            if (ex >= mx && ex <= mx + mw && ey >= my && ey <= my + mh)
-                return Clutter.EVENT_PROPAGATE;
-            // Click is outside — close menu
-            if (this._contextMenu) {
-                this._contextMenu.destroy();
-                this._contextMenu = null;
-            }
-            global.stage.disconnect(clickId);
-            return Clutter.EVENT_PROPAGATE;
-        });
-        this._contextMenuClickId = clickId;
     }
 
     // ── Activate ──────────────────────────────────────────────────────────────
 
     _activateGroup(group, focusWin = null) {
         const tracker = Shell.WindowTracker.get_default();
+
+        // Where the stage's card sits, for windows that come back out of the
+        // strip. Captured now: the card is rebuilt or slides away before the
+        // switch below runs.
+        const card = this._containers.find(c => c._groupRef === group);
+        const [cardX, cardY] = card ? card.get_transformed_position() : [this._geo.visX, this._geo.visY];
+
+        // Clicking the stage that is already in front brings up its next
+        // window, like Stage Manager's "One at a Time": the way to reach one
+        // window of a multi-window stage. Stable order, so repeated clicks
+        // visit every window rather than swapping the two most recent.
+        const focusedNow = global.display.get_focus_window();
+        if ((!focusWin || focusWin === focusedNow) &&
+            group.windows.length > 1 && group.windows.includes(focusedNow)) {
+            const ordered = [...group.windows].sort((a, b) => a.get_stable_sequence() - b.get_stable_sequence());
+            const next = ordered[(ordered.indexOf(focusedNow) + 1) % ordered.length];
+            this._openOneWindow(next, cardX, cardY);
+            return;
+        }
 
         // Visual transition: clicked container pops, others shrink and fade
         this._hideTooltip();
@@ -2093,7 +2331,7 @@ export default class StageArc extends Extension {
                 });
             }
             group.windows.forEach(win => {
-                if (win.minimized) win.unminimize();
+                if (win.minimized) this._flyOutOfStrip(win, cardX, cardY);
                 win.raise();
             });
 
@@ -2101,12 +2339,11 @@ export default class StageArc extends Extension {
             if (!target) group.appIds.forEach(id => { if (!target) target = this._groupStates.get(id)?.lastFocused; });
             (target ?? group.windows[0])?.activate(global.get_current_time());
 
-            // Only hide if NOT in persistent mode, otherwise just refresh
-            if (this._persistMode) {
-                this._refresh();
-            } else {
-                this._hidePanel();
-            }
+            // Stays up so a stage can be clicked again to cycle its windows;
+            // the pointer leaving hides it. A keyboard-opened strip falls
+            // back to that rule too, now that a choice has been made.
+            this._keyOpened = false;
+            this._refresh();
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -2221,73 +2458,35 @@ export default class StageArc extends Extension {
         const geo = this._geo;
 
         // Panel slides in
-        this._panel.ease({ x: geo.visX, y: geo.visY, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_BACK });
+        // The vertical layout centres a side strip itself (_redrawVertical);
+        // easing it to visY slid it to the top, and the next redraw snapped it
+        // back to the middle.
+        const keepY = this._layoutMode === 'vertical' && this._pos !== 'bottom';
+        this._panel.show();
+        this._panel.ease({ x: geo.visX, y: keepY ? this._panel.y : geo.visY, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_CUBIC });
 
-        // Cascade entrance: each container slides in with staggered delay
-        this._containers.forEach((c, i) => {
-            const origX = c._baseX;
-            const origY = c._baseY;
-            const isBottom = this._pos === 'bottom';
-
-            // Start offset: items slide in from outside with more travel distance
-            if (isBottom) {
-                c.set_position(origX, origY + 80);
-            } else if (this._pos === 'right') {
-                c.set_position(origX + 80, origY);
-            } else {
-                c.set_position(origX - 80, origY);
-            }
-            c.opacity = 0;
-            c.set_scale(0.6, 0.6);
-
-            // Staggered entrance with spring-like bounce
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.round((40 + i * 50) * this._animSpeed), () => {
-                if (!this._containers.includes(c)) return GLib.SOURCE_REMOVE;
-                c.ease({
-                    x: origX, y: origY,
-                    opacity: 255,
-                    scale_x: c._isActive ? 1.0 : this._inactiveScale,
-                    scale_y: c._isActive ? 1.0 : this._inactiveScale,
-                    rotation_angle_z: c._isActive ? 0 : -this._inactiveTilt * 0.55,
-                    duration: Math.round(350 * this._animSpeed),
-                    mode: Clutter.AnimationMode.EASE_OUT_BACK,
-                });
-                return GLib.SOURCE_REMOVE;
-            });
-        });
+        // The strip slides in as one piece, as on macOS. The staggered
+        // per-card entrance it replaced started every card invisible and
+        // offset, and the cards slide in under a pointer already at the edge:
+        // their hover handler re-eased every card mid-entrance, and the strip
+        // flickered -- cards appearing, fading out, then snapping back.
     }
 
     _hidePanel() {
         if (!this._isVisible) return;
         this._isVisible = false;
+        this._keySel = null;
         this._cancelHide();
         this._hideTooltip();
         const geo = this._geo;
 
-        // Cascade exit: containers slide out with stagger (reverse order)
-        const total = this._containers.length;
-        this._containers.forEach((c, i) => {
-            const isBottom = this._pos === 'bottom';
-            const exitX = isBottom ? c._baseX : (this._pos === 'right' ? c._baseX + 60 : c._baseX - 60);
-            const exitY = isBottom ? c._baseY + 60 : c._baseY;
-
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, (total - 1 - i) * 25, () => {
-                if (!this._containers.includes(c)) return GLib.SOURCE_REMOVE;
-                c.ease({
-                    x: exitX, y: exitY,
-                    opacity: 0,
-                    scale_x: 0.8, scale_y: 0.8,
-                    duration: 200,
-                    mode: Clutter.AnimationMode.EASE_IN_QUAD,
-                });
-                return GLib.SOURCE_REMOVE;
-            });
-        });
-
-        // Panel slides out after containers
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.max(80, total * 25), () => {
-            this._panel.ease({ x: geo.hidX, y: geo.hidY, duration: 200, mode: Clutter.AnimationMode.EASE_IN_QUAD });
-            return GLib.SOURCE_REMOVE;
+        // Slides out as one piece, matching the entrance, then hides: parked
+        // just past its monitor's edge it can sit over a neighbouring one.
+        const keepY = this._layoutMode === 'vertical' && this._pos !== 'bottom';
+        this._panel.ease({
+            x: geo.hidX, y: keepY ? this._panel.y : geo.hidY, duration: 200,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+            onComplete: () => { if (!this._isVisible) this._panel.hide(); },
         });
     }
 
