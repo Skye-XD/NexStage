@@ -1,4 +1,4 @@
-UUID    := nexstage@nexvar
+UUID    := nexstage@skye-xd.github.io
 PREFIX  := $(HOME)/.local/share/gnome-shell/extensions
 DEST    := $(PREFIX)/$(UUID)
 FILES   := metadata.json extension.js prefs.js schemas
