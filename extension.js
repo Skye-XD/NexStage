@@ -772,10 +772,15 @@ export default class StageArc extends Extension {
         this._bindKey('keybinding-toggle', () => {
             this._isVisible ? this._hidePanel() : this._showPanel();
         });
+        // Stepping through stages shows the sidebar: moving a selection
+        // nobody can see, then activating it, read as the sidebar opening
+        // and snapping shut.
         this._bindKey('keybinding-next', () => {
+            if (!this._isVisible) this._showPanel();
             this._scrollTo(Math.round(this._offset) + 1);
         });
         this._bindKey('keybinding-prev', () => {
+            if (!this._isVisible) this._showPanel();
             this._scrollTo(Math.round(this._offset) - 1);
         });
         this._bindKey('keybinding-activate', () => {
@@ -2207,7 +2212,12 @@ export default class StageArc extends Extension {
 
         this._isVisible = true;
         this._cancelHide();
-        this._refresh();
+        // _refresh() rebuilds every thumbnail 50ms later, after the entrance
+        // below had been scheduled on the old ones -- each timer then eased a
+        // destroyed actor. Rebuild synchronously instead.
+        if (this._refreshTo) { GLib.source_remove(this._refreshTo); this._refreshTo = null; }
+        this._buildGroups();
+        this._redraw();
         const geo = this._geo;
 
         // Panel slides in
@@ -2232,6 +2242,7 @@ export default class StageArc extends Extension {
 
             // Staggered entrance with spring-like bounce
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, Math.round((40 + i * 50) * this._animSpeed), () => {
+                if (!this._containers.includes(c)) return GLib.SOURCE_REMOVE;
                 c.ease({
                     x: origX, y: origY,
                     opacity: 255,
@@ -2261,6 +2272,7 @@ export default class StageArc extends Extension {
             const exitY = isBottom ? c._baseY + 60 : c._baseY;
 
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, (total - 1 - i) * 25, () => {
+                if (!this._containers.includes(c)) return GLib.SOURCE_REMOVE;
                 c.ease({
                     x: exitX, y: exitY,
                     opacity: 0,
