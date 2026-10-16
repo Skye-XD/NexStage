@@ -1,5 +1,7 @@
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Cogl from 'gi://Cogl';
+import GObject from 'gi://GObject';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
@@ -21,6 +23,31 @@ const GHOST_SIZE      = 100;
 // Close button constants
 const CLOSE_BTN_SIZE  = 22;
 const CLOSE_BTN_MARGIN = 6;
+
+// Rounds the corners of whatever it is applied to. St's clip_to_allocation
+// clips to a plain rectangle, whatever the border-radius says.
+const ROUNDED_CLIP_DECLARATIONS = `
+uniform vec2 size;
+uniform float radius;
+`;
+const ROUNDED_CLIP_CODE = `
+vec2 p = cogl_tex_coord_in[0].xy * size;
+vec2 q = abs(p - size * 0.5) - (size * 0.5 - vec2(radius));
+float d = length(max(q, 0.0)) - radius;
+cogl_color_out *= clamp(0.5 - d, 0.0, 1.0);
+`;
+const RoundedClipEffect = GObject.registerClass(
+class RoundedClipEffect extends Shell.GLSLEffect {
+    vfunc_build_pipeline() {
+        this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT,
+            ROUNDED_CLIP_DECLARATIONS, ROUNDED_CLIP_CODE, false);
+    }
+
+    setGeometry(width, height, radius) {
+        this.set_uniform_float(this.get_uniform_location('size'), 2, [width, height]);
+        this.set_uniform_float(this.get_uniform_location('radius'), 1, [radius]);
+    }
+});
 
 const KEYBINDINGS = [
     'keybinding-toggle',
@@ -108,11 +135,32 @@ export default class StageArc extends Extension {
                     rect: win.get_frame_rect(),
                     maximized: win.maximized_horizontally && win.maximized_vertically,
                 } : null;
+                this._tilePending = false;
+                // Follows the pointer for the drop preview. Crossing events
+                // are not delivered during the grab, but the cursor tracker
+                // still reports every motion.
+                this._cursorSig ??= global.backend.get_cursor_tracker()
+                    .connect('position-invalidated', () => this._updateDropPreview());
             }
         });
         this._grabEndSig = global.display.connect('grab-op-end', (_d, win, op) => {
             this._windowGrab = false;
+            this._disconnectCursor();
             this._onWindowDropped(win, op);
+        });
+        // The strip shares its edge with mutter's edge tiling. While mutter
+        // shows a tile preview the drop is mutter's: the window tiles and the
+        // strip leaves it alone. Only "show" re-evaluates the preview: on
+        // release mutter may hide its preview before grab-op-end, and that
+        // must not turn a tile into a drop into the strip, so the decision
+        // stays as of the last pointer motion.
+        this._tilePending = false;
+        this._tileShowSig = global.window_manager.connect('show-tile-preview', () => {
+            this._tilePending = true;
+            this._updateDropPreview();
+        });
+        this._tileHideSig = global.window_manager.connect('hide-tile-preview', () => {
+            this._tilePending = false;
         });
         this._connectWorkspaceSignals();
         this._wsSwitchSig = global.workspace_manager.connect('active-workspace-changed', () => {
@@ -185,6 +233,10 @@ export default class StageArc extends Extension {
         if (this._focusSig)    { global.display.disconnect(this._focusSig);    this._focusSig = null; }
         if (this._grabEndSig)  { global.display.disconnect(this._grabEndSig);  this._grabEndSig = null; }
         if (this._grabBeginSig) { global.display.disconnect(this._grabBeginSig); this._grabBeginSig = null; }
+        if (this._tileShowSig) { global.window_manager.disconnect(this._tileShowSig); this._tileShowSig = null; }
+        if (this._tileHideSig) { global.window_manager.disconnect(this._tileHideSig); this._tileHideSig = null; }
+        this._disconnectCursor();
+        this._endDropPreview(true);
         if (this._winCreatedSig) { global.display.disconnect(this._winCreatedSig); this._winCreatedSig = null; }
         if (this._restackedSig) { global.display.disconnect(this._restackedSig); this._restackedSig = null; }
         if (this._wsSwitchSig) { global.workspace_manager.disconnect(this._wsSwitchSig); this._wsSwitchSig = null; }
@@ -194,6 +246,10 @@ export default class StageArc extends Extension {
         if (this._refreshTo)   { GLib.source_remove(this._refreshTo); this._refreshTo = null; }
         if (this._hideTimer)   { GLib.source_remove(this._hideTimer); this._hideTimer = null; }
         if (this._physicsId)   { GLib.source_remove(this._physicsId); this._physicsId = null; }
+        if (this._activateHideId) { GLib.source_remove(this._activateHideId); this._activateHideId = null; }
+        for (const restore of this._pendingRestores ?? []) restore();
+        this._pendingRestores = null;
+        this._grabStart = null;
 
         if (this._edge)  { this._edge.destroy();  this._edge = null; }
         if (this._panel) { this._panel.destroy(); this._panel = null; }
@@ -316,73 +372,158 @@ export default class StageArc extends Extension {
         this._saveMergeMap();
     }
 
-    // Stage Manager's "drag an app from the centre to the strip removes it from
-    // the group": a window move that ends over the visible sidebar takes its
-    // app out of its merged group and sends it to the strip as a stage of its
-    // own. The pointer reveals the sidebar on the way, as the poll already
-    // does for a held button at the edge. An app that is not merged is left
-    // where it was dropped.
-    _onWindowDropped(win, op) {
-        const [px, py] = global.get_pointer();
+    _disconnectCursor() {
+        if (!this._cursorSig) return;
+        global.backend.get_cursor_tracker().disconnect(this._cursorSig);
+        this._cursorSig = null;
+    }
+
+    _overStrip(px, py) {
         const geo = this._geo;
-        if (!win || !this._isVisible) return;
-        if (op !== Meta.GrabOp.MOVING && op !== Meta.GrabOp.MOVING_UNCONSTRAINED) return;
+        return !!geo && px >= geo.visX && px <= geo.visX + geo.panelW &&
+               py >= geo.visY && py <= geo.visY + geo.panelH;
+    }
 
-        if (px < geo.visX || px > geo.visX + geo.panelW ||
-            py < geo.visY || py > geo.visY + geo.panelH)
+    // While a window is dragged over the strip it shrinks, under the cursor,
+    // to the small preview it is about to become, and grows back on the way
+    // out -- so a drop into the strip is never a surprise. A clone does the
+    // drawing: it sits above the strip (the window itself would be below
+    // it), and the window, hidden meanwhile, is left untransformed for mutter.
+    // Whether the preview is shrunk is also what decides the drop.
+    _updateDropPreview() {
+        const win = this._grabStart?.win;
+        const actor = win?.get_compositor_private();
+        if (!this._windowGrab || !actor) return;
+        const [px, py] = global.get_pointer();
+        // A dragged window reveals the strip as soon as it is over the
+        // strip's area, well before the edge -- where mutter's tile zone is,
+        // and where the strip used to wait, so the tile preview always came
+        // up first. A plain hover still needs the edge.
+        if (!this._isVisible && this._overStrip(px, py)) this._showPanel();
+        const want = this._isVisible && !this._tilePending &&
+                     this._overStrip(px, py) && win.can_minimize();
+        let p = this._dropPreview;
+
+        if (want && !p?.shrunk) {
+            if (!p) {
+                const [ax, ay] = actor.get_transformed_position();
+                const clone = new Clutter.Clone({
+                    source: actor, reactive: false,
+                    width: actor.width, height: actor.height,
+                });
+                Main.uiGroup.add_child(clone);
+                p = this._dropPreview = { actor, clone, offX: px - ax, offY: py - ay };
+                // Scale about the grabbed point, so it stays under the cursor.
+                clone.set_pivot_point(p.offX / actor.width, p.offY / actor.height);
+                actor.opacity = 0;
+            }
+            p.shrunk = true;
+            const scale = Math.min(0.3, (this._geo.panelW * 0.8) / actor.width);
+            p.clone.ease({
+                scale_x: scale, scale_y: scale,
+                duration: 180,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            });
+        } else if (!want && p?.shrunk) {
+            p.shrunk = false;
+            p.clone.ease({
+                scale_x: 1, scale_y: 1,
+                duration: 180,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => {
+                    if (this._dropPreview === p && !p.shrunk) this._endDropPreview(true);
+                },
+            });
+        }
+        p?.clone.set_position(px - p.offX, py - p.offY);
+    }
+
+    // Drop the preview clone; the window is shown again unless it is about to
+    // be minimized into the strip (it then stays hidden until it is).
+    _endDropPreview(showWindow) {
+        const p = this._dropPreview;
+        if (!p) return;
+        this._dropPreview = null;
+        p.clone.destroy();
+        if (showWindow) {
+            try { p.actor.opacity = 255; } catch (_e) { /* window closed */ }
+        }
+    }
+
+    // Stage Manager's "drag an app from the centre to the strip removes it from
+    // the group": a window move that ends with its drop preview shrunk over
+    // the strip goes into the strip, and a merged app also leaves its group,
+    // so it becomes a stage of its own there. Anything else -- including a
+    // drop mutter is about to tile -- is left to mutter.
+    _onWindowDropped(win, op) {
+        // Taken now: held on, it would pin a closed window's MetaWindow until
+        // the next drag.
+        const start = this._grabStart?.win === win ? this._grabStart : null;
+        this._grabStart = null;
+        const p = this._dropPreview;
+        const moving = op === Meta.GrabOp.MOVING || op === Meta.GrabOp.MOVING_UNCONSTRAINED;
+        if (!win || !moving || !p?.shrunk || !this._geo ||
+            p.actor !== win.get_compositor_private()) {
+            this._endDropPreview(true);
             return;
+        }
+        const { actor, clone } = p;
+        this._dropPreview = null;
 
-        // Into the strip it goes, as on macOS. A merged app also leaves its
-        // group, so it becomes a stage of its own there.
         const app = Shell.WindowTracker.get_default().get_window_app(win);
         const appId = app?.get_id();
         if (appId && this._mergeMap.has(appId))
             this._unmergeApp(appId);
-        if (!win.can_minimize()) { this._refresh(); return; }
 
-        // Shrink into the strip where it was dropped, then minimize with the
-        // shell's effect skipped -- the minimize animation flies to the dock,
-        // which read as the window going to the panel rather than the strip.
-        const actor = win.get_compositor_private();
-        if (!actor) { win.minimize(); this._refresh(); return; }
-        const [ax, ay] = actor.get_transformed_position();
-        const tx = geo.visX + geo.panelW / 2, ty = py;
-        actor.set_pivot_point(0, 0);
-        actor.ease({
-            scale_x: 0.08, scale_y: 0.08,
-            translation_x: tx - ax - actor.width * 0.04,
-            translation_y: ty - ay - actor.height * 0.04,
+        // The preview flies on into the strip, then the window is minimized
+        // with the shell's effect skipped -- the minimize animation flies to
+        // the dock, which read as the window going to the panel rather than
+        // the strip.
+        const [, py] = global.get_pointer();
+        const geo = this._geo;
+        const tx = geo.visX + geo.panelW / 2;
+        clone.ease({
+            x: tx - p.offX, y: py - p.offY,
+            scale_x: clone.scale_x * 0.4, scale_y: clone.scale_y * 0.4,
             opacity: 0,
-            duration: 250,
+            duration: 220,
             mode: Clutter.AnimationMode.EASE_IN_QUAD,
             onStopped: () => {
-                // The magic-lamp extension animates every minimize and ignores
-                // skipNextEffect, so stay invisible until the actor is hidden
-                // and only then put the transforms back.
+                clone.destroy();
+                if (!this._settings) {
+                    // Disabled mid-flight: just give the window back.
+                    try { actor.opacity = 255; } catch (_e) { /* closed */ }
+                    return;
+                }
+                // The magic-lamp extension animates every minimize, so the
+                // window stays invisible until its actor is hidden.
                 let restored = false;
+                let restoreId = 0;
                 const restore = () => {
                     if (restored) return;
                     restored = true;
+                    if (restoreId) GLib.source_remove(restoreId);
+                    restoreId = 0;
+                    this._pendingRestores?.delete(restore);
                     try {
                         actor.disconnect(hideId);
-                        actor.set_scale(1, 1);
-                        actor.translation_x = 0;
-                        actor.translation_y = 0;
                         actor.opacity = 255;
                     } catch (_e) {
                         // The window closed meanwhile; nothing to restore.
                     }
                 };
                 const hideId = actor.connect('hide', restore);
-                // Never left invisible if the minimize does not hide it.
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                // Never left invisible if the minimize does not hide it, nor
+                // by disable() landing in between (it runs what is pending).
+                restoreId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                    restoreId = 0;
                     restore();
                     return GLib.SOURCE_REMOVE;
                 });
+                (this._pendingRestores ??= new Set()).add(restore);
                 // Back to where it was before the drag, while it is invisible,
                 // so it comes out of the strip there and not at the screen
                 // edge it was dropped on.
-                const start = this._grabStart?.win === win ? this._grabStart : null;
                 if (start?.maximized)
                     win.maximize();
                 else if (start)
@@ -395,6 +536,13 @@ export default class StageArc extends Extension {
                 this._refresh();
             },
         });
+    }
+
+    // The active / hover outline of a card, on the card and on its overlay.
+    _setCardBorder(card, border) {
+        card.style = card.style.replace(/border: [^;]+;/, border);
+        if (card._outline)
+            card._outline.style = card._outline.style.replace(/border: [^;]+;/, border);
     }
 
     // Bring up a single window of a stage, out of its card if minimized.
@@ -944,7 +1092,9 @@ export default class StageArc extends Extension {
             if (!this._isVisible) this._showPanel();
             this._activateGroup(group);
             // A keyboard choice is final: the strip goes once it is made.
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+            if (this._activateHideId) GLib.source_remove(this._activateHideId);
+            this._activateHideId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+                this._activateHideId = null;
                 this._hidePanel();
                 return GLib.SOURCE_REMOVE;
             });
@@ -1234,8 +1384,7 @@ export default class StageArc extends Extension {
             // Active group highlight: bright border on front card
             if (this._highlightActive && isActive && grid._cards[0]) {
                 const fc = grid._cards[0].card;
-                fc.style = fc.style.replace(
-                    /border: [^;]+;/, `border: 1.5px solid rgba(120,175,255,0.5);`
+                this._setCardBorder(fc, `border: 1.5px solid rgba(120,175,255,0.5);`
                 );
             }
 
@@ -1283,8 +1432,7 @@ export default class StageArc extends Extension {
                     });
                     const frontCard = grid._cards[0]?.card;
                     if (frontCard) {
-                        frontCard.style = frontCard.style.replace(
-                            /border: [^;]+;/, 'border: 1px solid rgba(255,255,255,0.25);'
+                        this._setCardBorder(frontCard, 'border: 1px solid rgba(255,255,255,0.25);'
                         );
                     }
                     // Tooltip after short delay
@@ -1335,7 +1483,7 @@ export default class StageArc extends Extension {
                         const restoreBorder = (this._highlightActive && container._isActive)
                             ? 'border: 1.5px solid rgba(120,175,255,0.5);'
                             : 'border: 1px solid rgba(255,255,255,0.08);';
-                        frontCard.style = frontCard.style.replace(/border: [^;]+;/, restoreBorder);
+                        this._setCardBorder(frontCard, restoreBorder);
                     }
                     // Cancel pending fan; start grace timer before collapsing
                     const g = container._grid;
@@ -1574,13 +1722,12 @@ export default class StageArc extends Extension {
                 container.set_rotation_angle(Clutter.RotateAxis.Z_AXIS, 0);
                 container.set_scale(1.06, 1.06);
                 const fc = grid._cards[0].card;
-                fc.style = fc.style.replace(/border: [^;]+;/, 'border: 2px solid rgba(255,255,255,0.85);');
+                this._setCardBorder(fc, 'border: 2px solid rgba(255,255,255,0.85);');
             } else
             // Active group highlight: bright border on front card
             if (this._highlightActive && isActive && grid._cards[0]) {
                 const fc = grid._cards[0].card;
-                fc.style = fc.style.replace(
-                    /border: [^;]+;/, 'border: 1.5px solid rgba(120,175,255,0.5);'
+                this._setCardBorder(fc, 'border: 1.5px solid rgba(120,175,255,0.5);'
                 );
             }
 
@@ -1625,8 +1772,7 @@ export default class StageArc extends Extension {
                     });
                     const frontCard = grid._cards[0]?.card;
                     if (frontCard) {
-                        frontCard.style = frontCard.style.replace(
-                            /border: [^;]+;/, 'border: 1px solid rgba(255,255,255,0.25);'
+                        this._setCardBorder(frontCard, 'border: 1px solid rgba(255,255,255,0.25);'
                         );
                     }
                     // Tooltip after short delay
@@ -1680,7 +1826,7 @@ export default class StageArc extends Extension {
                         const restoreBorder = (this._highlightActive && container._isActive)
                             ? 'border: 1.5px solid rgba(120,175,255,0.5);'
                             : 'border: 1px solid rgba(255,255,255,0.08);';
-                        frontCard.style = frontCard.style.replace(/border: [^;]+;/, restoreBorder);
+                        this._setCardBorder(frontCard, restoreBorder);
                     }
                     // Cancel pending fan; start grace timer before collapsing
                     const g = container._grid;
@@ -1871,20 +2017,42 @@ export default class StageArc extends Extension {
             });
             card.set_pivot_point(0.5, 0.5);
 
-            const clone = actor
-                ? new Clutter.Clone({ source: actor, width: cW, height: cH })
-                : new St.Widget({
+            // The actor is the window's buffer: its frame plus invisible
+            // resize borders and client-side shadows, which are uneven (none
+            // at the top, the deepest at the bottom). Scaled whole into the
+            // card, the content sat flush with the top and inset at the
+            // bottom. Show the frame only, cropped by the wrap below.
+            let clone;
+            if (actor) {
+                const br = win.get_buffer_rect();
+                clone = new Clutter.Clone({
+                    source: actor,
+                    width: Math.round(br.width * s), height: Math.round(br.height * s),
+                    x: Math.round((br.x - fr.x) * s), y: Math.round((br.y - fr.y) * s),
+                });
+            } else {
+                clone = new St.Widget({
                     style: `background-color:#2a2a2a; border-radius:${r}px;`,
                     width: cW, height: cH,
                 });
-            // Clip clone inside rounded card
+            }
             const cloneWrap = new St.Widget({
                 width: cW, height: cH,
                 clip_to_allocation: true,
-                style: `border-radius: ${r}px;`,
             });
+            const roundClip = new RoundedClipEffect();
+            roundClip.setGeometry(cW, cH, r);
+            cloneWrap.add_effect(roundClip);
             cloneWrap.add_child(clone);
             card.add_child(cloneWrap);
+            // The card's own border lies under the thumbnail (it stays, as the
+            // shape St draws the card's shadow from); this copy above it is
+            // the one that shows, at whatever width the highlight sets.
+            card._outline = new St.Widget({
+                width: cW, height: cH,
+                style: `border-radius: ${r}px; border: 1px solid rgba(255,255,255,0.08);`,
+            });
+            card.add_child(card._outline);
 
             // --- Close button (macOS style, hidden by default) ---
             const btnSize = Math.round(CLOSE_BTN_SIZE * scale);

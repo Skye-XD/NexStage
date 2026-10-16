@@ -1,7 +1,7 @@
 UUID    := nexstage@skye-xd.github.io
 PREFIX  := $(HOME)/.local/share/gnome-shell/extensions
 DEST    := $(PREFIX)/$(UUID)
-FILES   := metadata.json extension.js prefs.js schemas
+FILES   := metadata.json extension.js prefs.js schemas LICENSE
 
 .PHONY: all compile-schemas install uninstall pack reload enable disable logs clean
 
