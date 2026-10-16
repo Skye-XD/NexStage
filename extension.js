@@ -6,6 +6,7 @@ import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const BASE_GRID_W     = 158;
@@ -48,6 +49,12 @@ class RoundedClipEffect extends Shell.GLSLEffect {
         this.set_uniform_float(this.get_uniform_location('radius'), 1, [radius]);
     }
 });
+
+// A hover reveals the strip only on a push against the screen edge, as the
+// shell's hot corner does (same values): moving to a web page's side menu
+// stops at the edge and opens nothing; pushing on past it opens the strip.
+const PRESSURE_THRESHOLD = 100;     // px of push
+const PRESSURE_TIMEOUT   = 1000;    // ms
 
 const KEYBINDINGS = [
     'keybinding-toggle',
@@ -136,6 +143,7 @@ export default class StageArc extends Extension {
                     maximized: win.maximized_horizontally && win.maximized_vertically,
                 } : null;
                 this._tilePending = false;
+                this._endDropPreview(true);
                 // Follows the pointer for the drop preview. Crossing events
                 // are not delivered during the grab, but the cursor tracker
                 // still reports every motion.
@@ -251,6 +259,7 @@ export default class StageArc extends Extension {
         this._pendingRestores = null;
         this._grabStart = null;
 
+        this._teardownPressure();
         if (this._edge)  { this._edge.destroy();  this._edge = null; }
         if (this._panel) { this._panel.destroy(); this._panel = null; }
 
@@ -372,6 +381,48 @@ export default class StageArc extends Extension {
         this._saveMergeMap();
     }
 
+    _setupPressure() {
+        this._teardownPressure();
+        const mon = this._monitor, g = this._geo;
+        if (!mon || !g) return;
+        const others = Main.layoutManager.monitors.filter(m => m.x !== mon.x || m.y !== mon.y);
+        const alongY = m => m.y < g.edgeY + g.edgeH && m.y + m.height > g.edgeY;
+        const alongX = m => m.x < g.edgeX + g.edgeW && m.x + m.width > g.edgeX;
+        let line, directions, shared;
+        if (this._pos === 'bottom') {
+            const y = mon.y + mon.height;
+            line = { x1: g.edgeX, x2: g.edgeX + g.edgeW, y1: y, y2: y };
+            directions = Meta.BarrierDirection.NEGATIVE_Y;
+            shared = others.some(m => m.y === y && alongX(m));
+        } else if (this._pos === 'right') {
+            const x = mon.x + mon.width;
+            line = { x1: x, x2: x, y1: g.edgeY, y2: g.edgeY + g.edgeH };
+            directions = Meta.BarrierDirection.NEGATIVE_X;
+            shared = others.some(m => m.x === x && alongY(m));
+        } else {
+            line = { x1: mon.x, x2: mon.x, y1: g.edgeY, y2: g.edgeY + g.edgeH };
+            directions = Meta.BarrierDirection.POSITIVE_X;
+            shared = others.some(m => m.x + m.width === mon.x && alongY(m));
+        }
+        if (shared) return;
+
+        this._pressure = new Layout.PressureBarrier(
+            PRESSURE_THRESHOLD, PRESSURE_TIMEOUT, Shell.ActionMode.NORMAL);
+        this._pressure.connect('trigger', () => { if (!this._isVisible) this._showPanel(); });
+        this._barrier = new Meta.Barrier({ backend: global.backend, ...line, directions });
+        this._pressure.addBarrier(this._barrier);
+    }
+
+    _teardownPressure() {
+        if (this._barrier) {
+            this._pressure?.removeBarrier(this._barrier);
+            this._barrier.destroy();
+            this._barrier = null;
+        }
+        this._pressure?.destroy();
+        this._pressure = null;
+    }
+
     _disconnectCursor() {
         if (!this._cursorSig) return;
         global.backend.get_cursor_tracker().disconnect(this._cursorSig);
@@ -389,7 +440,10 @@ export default class StageArc extends Extension {
     // out -- so a drop into the strip is never a surprise. A clone does the
     // drawing: it sits above the strip (the window itself would be below
     // it), and the window, hidden meanwhile, is left untransformed for mutter.
-    // Whether the preview is shrunk is also what decides the drop.
+    // Once made, the clone stays until the drag ends, full size away from the
+    // strip: handing back to the window on the way out put it under the strip
+    // and the clone over it on the way in, so the two swapped places with
+    // every crossing. Whether the preview is shrunk is what decides the drop.
     _updateDropPreview() {
         const win = this._grabStart?.win;
         const actor = win?.get_compositor_private();
@@ -430,12 +484,14 @@ export default class StageArc extends Extension {
                 scale_x: 1, scale_y: 1,
                 duration: 180,
                 mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                onComplete: () => {
-                    if (this._dropPreview === p && !p.shrunk) this._endDropPreview(true);
-                },
             });
         }
-        p?.clone.set_position(px - p.offX, py - p.offY);
+        // Where the window really is, which mutter may hold back from the
+        // pointer (at a monitor's top edge); the pivot is the grabbed point.
+        if (p) {
+            const [ax, ay] = actor.get_transformed_position();
+            p.clone.set_position(ax, ay);
+        }
     }
 
     // Drop the preview clone; the window is shown again unless it is about to
@@ -448,6 +504,35 @@ export default class StageArc extends Extension {
         if (showWindow) {
             try { p.actor.opacity = 255; } catch (_e) { /* window closed */ }
         }
+    }
+
+    // Released outside the strip: the window replaces its copy. The copy is
+    // drawn above the strip and the window below it, so swapped while the
+    // window lies over the visible strip, the strip's thumbnails would jump in
+    // front of it. The strip slides out first instead -- macOS clears the
+    // strip for a window over it too -- and the swap happens once it is gone.
+    // A tile is mutter's: the window moves and resizes at once, so it is
+    // swapped straight away and the strip just leaves with it.
+    _handBackDropPreview(win) {
+        const p = this._dropPreview;
+        if (!p) return;
+        const r = win?.get_frame_rect();
+        const g = this._geo;
+        const overStrip = r && g && this._isVisible &&
+            r.x < g.visX + g.panelW && r.x + r.width > g.visX &&
+            r.y < g.visY + g.panelH && r.y + r.height > g.visY;
+        if (!overStrip || this._persistMode) {
+            this._endDropPreview(true);
+            return;
+        }
+        if (this._tilePending) {
+            this._endDropPreview(true);
+            this._hidePanel();
+            return;
+        }
+        this._hidePanel(() => {
+            if (this._dropPreview === p) this._endDropPreview(true);
+        });
     }
 
     // Stage Manager's "drag an app from the centre to the strip removes it from
@@ -464,7 +549,7 @@ export default class StageArc extends Extension {
         const moving = op === Meta.GrabOp.MOVING || op === Meta.GrabOp.MOVING_UNCONSTRAINED;
         if (!win || !moving || !p?.shrunk || !this._geo ||
             p.actor !== win.get_compositor_private()) {
-            this._endDropPreview(true);
+            this._handBackDropPreview(win);
             return;
         }
         const { actor, clone } = p;
@@ -741,7 +826,13 @@ export default class StageArc extends Extension {
 
         this._setupReserveSpace();
 
-        this._edge.connect('enter-event',  () => { if (!this._isVisible) this._showPanel(); });
+        // Touching the edge reveals only where no pressure barrier could go
+        // (an edge another monitor shares: a barrier there would hold the
+        // pointer back from crossing to it).
+        this._setupPressure();
+        this._edge.connect('enter-event', () => {
+            if (!this._isVisible && !this._pressure) this._showPanel();
+        });
         this._panel.connect('enter-event', () => { if (!this._dragging) this._cancelHide(); });
         this._panel.connect('leave-event', () => { if (this._isVisible && !this._dragging) this._startHide(); });
 
@@ -857,6 +948,7 @@ export default class StageArc extends Extension {
     _destroyUI() {
         this._cancelHide();
         this._teardownReserveSpace();
+        this._teardownPressure();
         if (this._edge)  { this._edge.destroy();  this._edge = null; }
         if (this._panel) { this._panel.destroy(); this._panel = null; }
     }
@@ -2640,8 +2732,8 @@ export default class StageArc extends Extension {
         // flickered -- cards appearing, fading out, then snapping back.
     }
 
-    _hidePanel() {
-        if (!this._isVisible) return;
+    _hidePanel(onHidden) {
+        if (!this._isVisible) { onHidden?.(); return; }
         this._isVisible = false;
         this._keySel = null;
         this._cancelHide();
@@ -2655,6 +2747,8 @@ export default class StageArc extends Extension {
             x: geo.hidX, y: keepY ? this._panel.y : geo.hidY, duration: 200,
             mode: Clutter.AnimationMode.EASE_IN_QUAD,
             onComplete: () => { if (!this._isVisible) this._panel.hide(); },
+            // Called interrupted or not, so nobody waits on it forever.
+            onStopped: () => onHidden?.(),
         });
     }
 
