@@ -2703,8 +2703,11 @@ export default class StageArc extends Extension {
         const clear = !overlapsPanel || !hasWindowsOnMonitor;
 
         if (clear && !this._persistMode) {
-            this._persistMode = true;
             if (!this._isVisible) this._showPanel();
+            // A refused show (overview up, a fullscreen window being watched)
+            // must not latch persistent mode with the strip hidden: every
+            // later check would see it set and never show it again.
+            this._persistMode = this._isVisible;
         } else if (!clear && this._persistMode) {
             this._persistMode = false;
             this._hidePanel();
