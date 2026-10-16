@@ -95,6 +95,7 @@ export default class StageArc extends Extension {
         this._dragStartX    = 0;
         this._dragStartY    = 0;
         this._dragCandidate = null;
+        this._windowGrab    = false;
 
         this._mergeMap      = new Map();
         this._vertOffset    = 0;   // vertical mode scroll offset (index float)
@@ -202,6 +203,11 @@ export default class StageArc extends Extension {
             this._monitor = this._pickMonitor();
             this._rebuild();
         });
+        // The strip is not tracked by the shell's fullscreen hiding (see
+        // _buildUI), so it gets out of a fullscreen window's way itself.
+        this._fullscreenSig = global.display.connect('in-fullscreen-changed', () => {
+            if (this._isVisible && this._watchingFullscreen(this._monitor)) this._hidePanel();
+        });
 
         this._settingsSig = this._settings.connect('changed', (_s, key) => {
             if (key === 'order-map') {
@@ -237,6 +243,7 @@ export default class StageArc extends Extension {
         if (this._overviewShowSig) { Main.overview.disconnect(this._overviewShowSig); this._overviewShowSig = null; }
         if (this._overviewHideSig)  { Main.overview.disconnect(this._overviewHideSig);  this._overviewHideSig = null; }
         if (this._monitorSig)       { Main.layoutManager.disconnect(this._monitorSig);  this._monitorSig      = null; }
+        if (this._fullscreenSig) { global.display.disconnect(this._fullscreenSig); this._fullscreenSig = null; }
         if (this._settingsSig) { this._settings.disconnect(this._settingsSig); this._settingsSig = null; }
         if (this._focusSig)    { global.display.disconnect(this._focusSig);    this._focusSig = null; }
         if (this._grabEndSig)  { global.display.disconnect(this._grabEndSig);  this._grabEndSig = null; }
@@ -258,6 +265,9 @@ export default class StageArc extends Extension {
         for (const restore of this._pendingRestores ?? []) restore();
         this._pendingRestores = null;
         this._grabStart = null;
+        // Disabled mid-drag, grab-op-end is never seen: left set, plain edge
+        // contact would open the strip as if a window were being dragged.
+        this._windowGrab = false;
 
         this._teardownPressure();
         if (this._edge)  { this._edge.destroy();  this._edge = null; }
@@ -466,7 +476,12 @@ export default class StageArc extends Extension {
                     width: actor.width, height: actor.height,
                 });
                 Main.uiGroup.add_child(clone);
-                p = this._dropPreview = { actor, clone, offX: px - ax, offY: py - ay };
+                p = this._dropPreview = { win, actor, clone, offX: px - ax, offY: py - ay };
+                // A window closed under the copy (or during the fly-in) must
+                // not be touched again: its actor is on its way to being
+                // destroyed, and GJS logs a critical for a destroyed actor
+                // that no try/catch catches.
+                p.closedId = win.connect('unmanaging', () => { p.closed = true; });
                 // Scale about the grabbed point, so it stays under the cursor.
                 clone.set_pivot_point(p.offX / actor.width, p.offY / actor.height);
                 actor.opacity = 0;
@@ -501,9 +516,14 @@ export default class StageArc extends Extension {
         if (!p) return;
         this._dropPreview = null;
         p.clone.destroy();
-        if (showWindow) {
-            try { p.actor.opacity = 255; } catch (_e) { /* window closed */ }
-        }
+        this._forgetPreviewWindow(p);
+        if (showWindow && !p.closed) p.actor.opacity = 255;
+    }
+
+    _forgetPreviewWindow(p) {
+        if (!p.closedId) return;
+        p.win.disconnect(p.closedId);
+        p.closedId = 0;
     }
 
     // Released outside the strip: the window replaces its copy. The copy is
@@ -575,9 +595,12 @@ export default class StageArc extends Extension {
             mode: Clutter.AnimationMode.EASE_IN_QUAD,
             onStopped: () => {
                 clone.destroy();
+                this._forgetPreviewWindow(p);
+                // Closed while the copy flew: nothing left to minimize.
+                if (p.closed) return;
                 if (!this._settings) {
                     // Disabled mid-flight: just give the window back.
-                    try { actor.opacity = 255; } catch (_e) { /* closed */ }
+                    actor.opacity = 255;
                     return;
                 }
                 // The magic-lamp extension animates every minimize, so the
@@ -614,9 +637,13 @@ export default class StageArc extends Extension {
                 else if (start)
                     win.move_frame(true, start.rect.x, start.rect.y);
 
-                // Opt out of the magic-lamp genie to the dock (patched in
-                // place to honour this one-shot flag).
-                actor._skipMinimizeEffect = true;
+                // Opt out of the magic-lamp genie to the dock (our lamp fork
+                // honours this one-shot flag). The contract: the flag is
+                // GLib.get_monotonic_time() at the request and is honoured
+                // only within a second, so one nothing consumed (the window
+                // could not minimize, the lamp was off) cannot skip a later
+                // ordinary genie.
+                actor._skipMinimizeEffect = GLib.get_monotonic_time();
                 win.minimize();
                 this._refresh();
             },
@@ -643,7 +670,8 @@ export default class StageArc extends Extension {
     _flyOutOfStrip(win, fromX, fromY) {
         const actor = win.get_compositor_private();
         if (!actor) { win.unminimize(); return; }
-        actor._skipMinimizeEffect = true;
+        // Timestamped one-shot genie opt-out, as in _onWindowDropped.
+        actor._skipMinimizeEffect = GLib.get_monotonic_time();
         win.unminimize();
         actor.remove_all_transitions();
         actor.set_pivot_point(0, 0);
@@ -812,7 +840,12 @@ export default class StageArc extends Extension {
             height: geo.panelH,
         });
         this._panel.set_position(geo.panelX, geo.panelY);
-        Main.layoutManager.addChrome(this._panel, { trackFullscreen: true });
+        // Not trackFullscreen: the strip's visibility is _showPanel/_hidePanel's
+        // alone. The shell's tracking re-showed the hidden strip on every
+        // fullscreen, overview or monitor change -- parked at hidX it then sat
+        // visible and clickable over the neighbouring monitor. _showPanel
+        // refuses a fullscreen monitor instead.
+        Main.layoutManager.addChrome(this._panel);
         if (!this._isVisible) this._panel.hide();   // shown again by _showPanel
 
         this._edge = new St.Widget({
@@ -980,10 +1013,15 @@ export default class StageArc extends Extension {
 
             if (true) {
                 if (!this._dragging) {
+                    // On the strip's monitor: past its edge may be another
+                    // monitor, all of which would otherwise count as hot.
+                    const onMon = px >= mon.x && px < mon.x + mon.width &&
+                                  py >= mon.y && py < mon.y + mon.height;
                     let hot = false;
                     if      (this._pos === 'bottom') hot = py >= mon.y + mon.height - 8;
                     else if (this._pos === 'right')  hot = px >= mon.x + mon.width - 8;
                     else                             hot = px <= mon.x + 8;
+                    hot &&= onMon;
                     if ((held || this._windowGrab) && hot && !this._isVisible) {
                         this._showPanel();
                     }
@@ -1191,9 +1229,11 @@ export default class StageArc extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
         });
+        // The same selection next/prev/activate use; the vertical strip never
+        // moves _offset, so closing by it hit the wrong stage.
         this._bindKey('keybinding-close', () => {
-            const idx = Math.round(this._offset);
-            const grp = this._groups[idx];
+            const idx = this._keySel ?? (this._layoutMode === 'vertical' ? null : Math.round(this._offset));
+            const grp = idx === null ? null : this._groups[idx];
             if (grp?.windows[0]) {
                 grp.windows[0].delete(global.get_current_time());
                 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
@@ -2675,6 +2715,15 @@ export default class StageArc extends Extension {
     // Prefer the monitor containing the focused window; fall back to pointer
     // monitor, then primary.
 
+    // Whether the focused window is fullscreen on this monitor. Not the
+    // monitor's inFullscreen: mutter keeps that set while a fullscreen
+    // window is anywhere on it, unfocused or under other windows, and the
+    // strip is wanted then.
+    _watchingFullscreen(mon) {
+        const win = global.display.focus_window;
+        return !!(mon && win?.is_fullscreen() && win.get_monitor() === mon.index);
+    }
+
     _pickMonitor() {
         // Single mode: always use primary monitor so edge trigger works from any monitor
         if (this._multiMonMode === 'single') {
@@ -2701,6 +2750,9 @@ export default class StageArc extends Extension {
 
         // If the monitor changed since last build, rebuild before showing
         const newMon = this._pickMonitor();
+        // Never over a fullscreen video or game being watched. Every way in
+        // (pressure, edge, drag, keys, persistence) comes through here.
+        if (this._watchingFullscreen(newMon)) return;
         if (newMon !== this._monitor) {
             this._monitor = newMon;
             this._rebuild();
