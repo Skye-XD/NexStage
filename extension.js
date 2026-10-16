@@ -191,8 +191,12 @@ export default class StageArc extends Extension {
             }
         });
 
+        // The overview and a watched fullscreen window hide the strip for the
+        // moment, not by choice: persistent mode is dropped with it, so the
+        // next check (overview 'hidden', the poll) shows the strip again.
         this._overviewShowSig = Main.overview.connect('showing', () => {
             this._cancelDrag();
+            this._persistMode = false;
             if (this._isVisible) this._hidePanel();
         });
         this._overviewHideSig = Main.overview.connect('hidden', () => {
@@ -206,7 +210,10 @@ export default class StageArc extends Extension {
         // The strip is not tracked by the shell's fullscreen hiding (see
         // _buildUI), so it gets out of a fullscreen window's way itself.
         this._fullscreenSig = global.display.connect('in-fullscreen-changed', () => {
-            if (this._isVisible && this._watchingFullscreen(this._monitor)) this._hidePanel();
+            if (this._isVisible && this._watchingFullscreen(this._monitor)) {
+                this._persistMode = false;
+                this._hidePanel();
+            }
         });
 
         this._settingsSig = this._settings.connect('changed', (_s, key) => {
@@ -992,6 +999,10 @@ export default class StageArc extends Extension {
         this._monitor = Main.layoutManager.primaryMonitor;
         this._destroyUI();
         this._loadConfig();
+        // The monitor the strip is for, by the mode just loaded: left at the
+        // primary, separate mode rebuilt again on every _showPanel (which
+        // finds focus elsewhere and rebuilds), and never showed.
+        this._monitor = this._pickMonitor();
         this._buildUI();
         if (wasVisible) this._showPanel();
         else this._refresh();
