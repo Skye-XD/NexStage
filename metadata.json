@@ -2,7 +2,7 @@
   "uuid": "nexstage@nexvar",
   "name": "NexStage — Stage Manager for GNOME",
   "description": "Stage Manager for GNOME 46–50. A macOS-style sidebar of live window thumbnails with smooth animations, an arc-carousel or vertical layout, raise/minimize-others modes, multi-monitor support, drag reorder, badges, and a 4-tab preferences window. Wayland & X11 ready. Built by NexVar.",
-  "shell-version": ["46", "47", "48", "49", "50"],
+  "shell-version": ["48", "49", "50", "51"],
   "version": 1,
   "version-name": "1.0.0",
   "settings-schema": "org.gnome.shell.extensions.nexstage",
