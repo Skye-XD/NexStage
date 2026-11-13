@@ -38,15 +38,17 @@ float d = length(max(q, 0.0)) - radius;
 cogl_color_out *= clamp(0.5 - d, 0.0, 1.0);
 `;
 const RoundedClipEffect = GObject.registerClass(
-class RoundedClipEffect extends Shell.GLSLEffect {
-    vfunc_build_pipeline() {
-        this.add_glsl_snippet(Cogl.SnippetHook.FRAGMENT,
-            ROUNDED_CLIP_DECLARATIONS, ROUNDED_CLIP_CODE, false);
+class RoundedClipEffect extends Clutter.ShaderEffect {
+    vfunc_get_static_snippet() {
+        const snippet = Cogl.Snippet.new(Cogl.SnippetHook.FRAGMENT,
+            ROUNDED_CLIP_DECLARATIONS, '');
+        snippet.set_post(ROUNDED_CLIP_CODE);
+        return snippet;
     }
 
     setGeometry(width, height, radius) {
-        this.set_uniform_float(this.get_uniform_location('size'), 2, [width, height]);
-        this.set_uniform_float(this.get_uniform_location('radius'), 1, [radius]);
+        this.set_uniform_float('size', 2, [width, height]);
+        this.set_uniform_float('radius', 1, [radius]);
     }
 });
 
@@ -2448,7 +2450,7 @@ export default class StageArc extends Extension {
         if (!win) return;
 
         const menu = new St.BoxLayout({
-            vertical: true,
+            orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             style: 'background-color: rgba(30, 30, 34, 0.92); '
                  + 'border-radius: 12px; '
